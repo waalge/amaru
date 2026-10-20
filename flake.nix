@@ -1,113 +1,149 @@
 {
-  description = "Amaru binary distribution";
+  description = "Amaru: a cardano node";
 
   inputs = {
+    flake-parts.url = "github:hercules-ci/flake-parts";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    let
-      supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "aarch64-darwin"
-      ];
-    in
-    flake-utils.lib.eachSystem supportedSystems (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-        release = {
-          x86_64-linux = {
-            archive = "amaru-10.11.20261022-linux-x86_64.tar.gz";
-            hash = "sha256-aMby401u1DVbjoVTmka1xEwBcGpHUGJ8qtLLKOl7dhw=";
-          };
-          aarch64-linux = {
-            archive = "amaru-10.11.20261022-linux-aarch64.tar.gz";
-            hash = "sha256-nxcCxfAUUrJ8oz96FdHs1ZFAZ36uDByfMBdudNGe7M0=";
-          };
-          aarch64-darwin = {
-            archive = "amaru-10.11.20261022-macos-aarch64.tar.gz";
-            hash = "sha256-HdebWHatrlydHlPezy+YPSeE058cLhc0OJtSFlTj3VY=";
-          };
-        }.${system};
+  outputs = inputs @ {flake-parts, ...}:
+    flake-parts.lib.mkFlake {inherit inputs;}
+    {
+      systems = ["x86_64-linux" "aarch64-darwin"];
 
-        amaru = pkgs.stdenvNoCC.mkDerivation {
-          pname = "amaru";
-          version = "10.11.20261022";
-          src = pkgs.fetchurl {
-            url = "https://github.com/pragma-org/amaru/releases/download/v10.11.20261022/${release.archive}";
-            hash = release.hash;
-          };
+      flake.nixosModules = {
+        amaru = import ./nix/modules/amaru.nix;
+        default = import ./nix/modules/amaru.nix;
+      };
 
-          dontConfigure = true;
-          dontBuild = true;
-
-          unpackPhase = ''
-            runHook preUnpack
-            mkdir extracted
-            tar -xzf "$src" -C extracted --strip-components=1
-            cd extracted
-            chmod -R u+w .
-            runHook postUnpack
-          '';
-
-          installPhase = ''
-            runHook preInstall
-            mkdir -p "$out/bin" "$out/share"
-            cp "bin/amaru" "$out/bin/amaru"
-            chmod +x "$out/bin/amaru"
-            if [ -d "share/doc" ]; then
-              mkdir -p "$out/share/doc"
-              cp -R "share/doc/." "$out/share/doc/"
-            fi
-            if [ -d "share/man" ]; then
-              mkdir -p "$out/share/man"
-              cp -R "share/man/." "$out/share/man/"
-            fi
-            runHook postInstall
-          '';
-
-          postInstall = ''
-            if [ -f "share/bash-completion/completions/amaru" ]; then
-              mkdir -p "$out/share/bash-completion/completions"
-              cp "share/bash-completion/completions/amaru" "$out/share/bash-completion/completions/amaru"
-            fi
-            if [ -f "share/zsh/site-functions/_amaru" ]; then
-              mkdir -p "$out/share/zsh/site-functions"
-              cp "share/zsh/site-functions/_amaru" "$out/share/zsh/site-functions/_amaru"
-            fi
-            if [ -f "share/fish/vendor_completions.d/amaru.fish" ]; then
-              mkdir -p "$out/share/fish/vendor_completions.d"
-              cp "share/fish/vendor_completions.d/amaru.fish" "$out/share/fish/vendor_completions.d/amaru.fish"
-            fi
-          '';
-
-          meta = with pkgs.lib; {
-            description = "A Cardano blockchain node implementation";
-            homepage = "https://github.com/pragma-org/amaru";
-            license = licenses.asl20;
-            mainProgram = "amaru";
-            platforms = [ system ];
-          };
+      perSystem = {
+        system,
+        ...
+      }: let
+        pkgs = import inputs.nixpkgs {
+          inherit system;
+          overlays = [(import inputs.rust-overlay)];
         };
+
+        toolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
+          extensions = ["rust-src" "rust-analyzer" "clippy"];
+        };
+
+        craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolchain;
+
+        # Deliberately broader than `craneLib.cleanCargoSource` (which keeps only .rs/.toml):
+        # test code throughout the workspace pulls in binary/text fixtures via `include_bytes!`.
+        # Scoped to what cargo actually touches, though: everything under `crates/` (so fixtures
+        # stay included wherever they live) plus the handful of root config files cargo/rustc
+        # read. This keeps repo-root docs/CHANGELOG/EDR/etc. edits from busting the derivation
+        # cache and forcing a full rebuild.
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./crates
+            ./Cargo.toml
+            ./Cargo.lock
+            ./rust-toolchain.toml
+            ./rustfmt.toml
+            ./.cargo
+          ];
+        };
+
+        nativeBuildInputs = with pkgs; [pkg-config rustPlatform.bindgenHook rocksdb git];
+        buildInputs = [pkgs.openssl.dev];
+
+        commonArgs = {
+          inherit src nativeBuildInputs buildInputs;
+          inherit (craneLib.crateNameFromCargoToml {cargoToml = ./crates/amaru/Cargo.toml;}) pname version;
+          strictDeps = true;
+
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+          # The fetch (from cardano-foundation/cardano-configurations) needs network
+          # access, which the Nix sandbox doesn't have. CI instead stages the real snapshots
+          # before building (.github/actions/stage-peer-snapshots) and sets this same flag so
+          # build.rs skips fetching and reuses them. Here we only stage empty placeholders, an
+          # explicitly supported offline fallback (see peer_snapshot.rs's own error message) --
+          # it keeps the build working, but a `nix build`-produced binary ships with no embedded
+          # big-ledger-pool peers, unlike CI/release binaries. At runtime that's not fatal (the
+          # node falls back to a single default bootstrap peer per network), just less robust.
+          AMARU_SKIP_PEER_SNAPSHOT_FETCH = "1";
+
+          postPatch = ''
+            if [ ! -d .git ]; then
+              git init -q
+              git config user.email "nix@localhost"
+              git config user.name "nix"
+              git add -A
+              git commit -q -m "nix build" --allow-empty
+            fi
+
+            for net_magic in mainnet:764824073 preprod:1 preview:2; do
+              net=''${net_magic%%:*}
+              magic=''${net_magic##*:}
+              mkdir -p "crates/amaru-node/config/peer-snapshots/$net"
+              cat > "crates/amaru-node/config/peer-snapshots/$net/peer-snapshot.json" <<EOF
+            { "NetworkMagic": $magic, "NodeToClientVersion": 23, "Point": { "blockPointHash": "0000000000000000000000000000000000000000000000000000000000000000", "blockPointSlot": 0 }, "bigLedgerPools": [] }
+            EOF
+            done
+          '';
+        };
+
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs
+          // {
+            pname = "amaru-workspace";
+            cargoExtraArgs = "--workspace";
+          });
+
+        amaru = craneLib.buildPackage (commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoExtraArgs = "-p amaru";
+            # `buildPackage` defaults to also running `cargo test` here. 
+            doCheck = false;
+            meta.description = "A Cardano blockchain node implementation";
+          });
       in {
         packages = {
-          amaru = amaru;
           default = amaru;
+          inherit amaru;
         };
 
-        apps = rec {
-          amaru = {
-            type = "app";
-            program = "${amaru}/bin/amaru";
-          };
-          default = amaru;
+        checks = {
+          inherit amaru;
+
+          clippy = craneLib.cargoClippy (commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "amaru-workspace";
+              cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
+            });
+
+          fmt = craneLib.cargoFmt {inherit src;};
+
+          # Mirrors the `cargo doc --no-deps --workspace` step in ci-coding-practices.yml.
+          doc = craneLib.cargoDoc (commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "amaru-workspace";
+              cargoExtraArgs = "--workspace";
+              env.RUSTDOCFLAGS = "-D warnings";
+            });
         };
-      })
-    // {
-      overlays.default = final: prev: {
-        amaru = self.packages.${final.system}.amaru;
+
+        devShells.default = pkgs.mkShell {
+          name = "dev-shell";
+          packages = [toolchain] ++ nativeBuildInputs;
+          inherit buildInputs;
+          LIBCLANG_PATH = commonArgs.LIBCLANG_PATH;
+        };
       };
     };
 }
